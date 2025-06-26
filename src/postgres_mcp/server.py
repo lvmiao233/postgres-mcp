@@ -7,8 +7,10 @@ import signal
 import sys
 from enum import Enum
 from typing import Any
+from typing import Dict
 from typing import List
 from typing import Literal
+from typing import Optional
 from typing import Union
 
 import mcp.types as types
@@ -32,6 +34,17 @@ from .sql import SqlDriver
 from .sql import check_hypopg_installation_status
 from .sql import obfuscate_password
 from .top_queries import TopQueriesCalc
+from .database_operations import SimpleCrudOperations, SchemaOperations
+from .database_operations.vector_operations import VectorOperations
+from .database_operations.data_types import (
+    ColumnDefinition,
+    DataType,
+    IndexDefinition,
+    QueryCondition,
+    QueryOptions,
+    TableDefinition,
+    VectorSearchOptions,
+)
 
 # Initialize FastMCP with default settings
 mcp = FastMCP("postgres-mcp")
@@ -506,6 +519,697 @@ async def get_top_queries(
         return format_text_response(result)
     except Exception as e:
         logger.error(f"Error getting slow queries: {e}")
+        return format_error_response(str(e))
+
+
+# ============================================================================
+# 新增的数据库操作MCP工具
+# ============================================================================
+
+@mcp.tool(description="Create a new table in the database with specified columns and constraints")
+async def create_table(
+    table_name: str = Field(description="Name of the table to create"),
+    columns: List[Dict[str, Any]] = Field(description="""List of column definitions. Each column must be a dictionary with:
+    - 'name': Column name (required)
+    - 'data_type': Data type (required) - one of: integer, bigint, serial, bigserial, text, varchar, char, boolean, timestamp, timestamptz, date, time, json, jsonb, uuid, vector, decimal, numeric, real, double_precision
+    - 'nullable': Whether column can be NULL (default: true)
+    - 'default': Default value (optional)
+    - 'primary_key': Whether this is primary key (default: false)
+    - 'unique': Whether this column is unique (default: false)
+    - 'check_constraint': Check constraint expression (optional)
+    - 'vector_dimensions': Required for vector type, specifies dimensions
+
+Examples:
+[
+    {"name": "id", "data_type": "serial", "primary_key": true, "nullable": false},
+    {"name": "name", "data_type": "varchar", "nullable": false},
+    {"name": "email", "data_type": "varchar", "unique": true},
+    {"name": "created_at", "data_type": "timestamp", "default": "CURRENT_TIMESTAMP"},
+    {"name": "embedding", "data_type": "vector", "vector_dimensions": 1536}
+]"""),
+    schema: str = Field(description="Schema name", default="public"),
+    constraints: List[str] = Field(description="Additional table-level constraints", default=[]),
+) -> ResponseType:
+    """Create a new table with specified columns and constraints."""
+    try:
+        sql_driver = await get_sql_driver()
+        crud_ops = SimpleCrudOperations(sql_driver)
+        
+        # 转换列定义
+        column_defs = []
+        for col in columns:
+            try:
+                data_type = DataType(col["data_type"])
+            except ValueError:
+                return format_error_response(f"Invalid data type: {col['data_type']}")
+            
+            column_def = ColumnDefinition(
+                name=col["name"],
+                data_type=data_type,
+                nullable=col.get("nullable", True),
+                default=col.get("default"),
+                primary_key=col.get("primary_key", False),
+                unique=col.get("unique", False),
+                check_constraint=col.get("check_constraint"),
+                vector_dimensions=col.get("vector_dimensions"),
+            )
+            column_defs.append(column_def)
+        
+        table_def = TableDefinition(
+            name=table_name,
+            columns=column_defs,
+            schema=schema,
+            constraints=constraints,
+        )
+        
+        result = await crud_ops.create_table(table_def)
+        
+        if result.success:
+            return format_text_response({
+                "success": True,
+                "message": result.message,
+                "table": f"{schema}.{table_name}",
+                "execution_time_ms": result.execution_time_ms,
+            })
+        else:
+            return format_error_response(result.message)
+            
+    except Exception as e:
+        logger.error(f"Error creating table {table_name}: {e}")
+        return format_error_response(str(e))
+
+
+@mcp.tool(description="Insert one or more records into a table")
+async def insert_records(
+    table_name: str = Field(description="Name of the table to insert into"),
+    data: List[Dict[str, Any]] = Field(description="""List of records to insert. Each record is a dictionary with column names as keys.
+Examples:
+[
+    {"name": "John Doe", "email": "john@example.com", "age": 30},
+    {"name": "Jane Smith", "email": "jane@example.com", "age": 25}
+]
+For vector columns, provide the vector as a list of floats:
+[
+    {"content": "Hello world", "embedding": [0.1, 0.2, 0.3, ...]}
+]"""),
+    schema: str = Field(description="Schema name", default="public"),
+    returning_columns: Optional[List[str]] = Field(description="List of columns to return from inserted records", default=None),
+) -> ResponseType:
+    """Insert one or more records into a table."""
+    try:
+        if not data:
+            return format_error_response("No data provided for insert")
+        
+        sql_driver = await get_sql_driver()
+        crud_ops = SimpleCrudOperations(sql_driver)
+        
+        result = await crud_ops.insert_records(
+            table_name=table_name,
+            data=data,
+            schema=schema,
+            returning_columns=returning_columns,
+        )
+        
+        if result.success:
+            response = {
+                "success": True,
+                "message": result.message,
+                "affected_rows": result.affected_rows,
+                "execution_time_ms": result.execution_time_ms,
+            }
+            if result.returned_data:
+                response["returned_data"] = result.returned_data
+            return format_text_response(response)
+        else:
+            return format_error_response(result.message)
+            
+    except Exception as e:
+        logger.error(f"Error inserting records into {table_name}: {e}")
+        return format_error_response(str(e))
+
+
+@mcp.tool(description="Update records in a table based on conditions")
+async def update_records(
+    table_name: str = Field(description="Name of the table to update"),
+    data: Dict[str, Any] = Field(description="""Data to update as a dictionary with column names as keys.
+Example: {"name": "Updated Name", "email": "new@example.com", "updated_at": "2024-01-01 10:00:00"}"""),
+    conditions: List[Dict[str, Any]] = Field(description="""List of conditions for WHERE clause. Each condition is a dictionary with:
+    - 'column': Column name
+    - 'operator': Operator (=, !=, >, <, >=, <=, LIKE, IN, NOT IN, IS NULL, IS NOT NULL)
+    - 'value': Value to compare (not needed for IS NULL/IS NOT NULL, list/tuple for IN/NOT IN)
+    - 'logical_operator': 'AND' or 'OR' (default: 'AND')
+
+Examples:
+[
+    {"column": "id", "operator": "=", "value": 1},
+    {"column": "status", "operator": "IN", "value": ["active", "pending"], "logical_operator": "AND"},
+    {"column": "name", "operator": "LIKE", "value": "John%"}
+]"""),
+    schema: str = Field(description="Schema name", default="public"),
+    returning_columns: Optional[List[str]] = Field(description="List of columns to return from updated records", default=None),
+) -> ResponseType:
+    """Update records in a table based on conditions."""
+    try:
+        sql_driver = await get_sql_driver()
+        crud_ops = CrudOperations(sql_driver)
+        
+        # 转换查询条件
+        query_conditions = []
+        for cond in conditions:
+            query_condition = QueryCondition(
+                column=cond["column"],
+                operator=cond["operator"],
+                value=cond.get("value"),
+                logical_operator=cond.get("logical_operator", "AND"),
+            )
+            query_conditions.append(query_condition)
+        
+        result = await crud_ops.update_records(
+            table_name=table_name,
+            data=data,
+            conditions=query_conditions,
+            schema=schema,
+            returning_columns=returning_columns,
+        )
+        
+        if result.success:
+            response = {
+                "success": True,
+                "message": result.message,
+                "affected_rows": result.affected_rows,
+                "execution_time_ms": result.execution_time_ms,
+            }
+            if result.returned_data:
+                response["returned_data"] = result.returned_data
+            return format_text_response(response)
+        else:
+            return format_error_response(result.message)
+            
+    except Exception as e:
+        logger.error(f"Error updating records in {table_name}: {e}")
+        return format_error_response(str(e))
+
+
+@mcp.tool(description="Delete records from a table based on conditions")
+async def delete_records(
+    table_name: str = Field(description="Name of the table to delete from"),
+    conditions: List[Dict[str, Any]] = Field(description="""List of conditions for WHERE clause. Each condition is a dictionary with:
+    - 'column': Column name
+    - 'operator': Operator (=, !=, >, <, >=, <=, LIKE, IN, NOT IN, IS NULL, IS NOT NULL)
+    - 'value': Value to compare (not needed for IS NULL/IS NOT NULL, list/tuple for IN/NOT IN)
+    - 'logical_operator': 'AND' or 'OR' (default: 'AND')
+
+Examples:
+[
+    {"column": "id", "operator": "=", "value": 1},
+    {"column": "status", "operator": "IN", "value": ["inactive", "deleted"]},
+    {"column": "created_at", "operator": "<", "value": "2023-01-01"}
+]"""),
+    schema: str = Field(description="Schema name", default="public"),
+    returning_columns: Optional[List[str]] = Field(description="List of columns to return from deleted records", default=None),
+) -> ResponseType:
+    """Delete records from a table based on conditions."""
+    try:
+        sql_driver = await get_sql_driver()
+        crud_ops = CrudOperations(sql_driver)
+        
+        # 转换查询条件
+        query_conditions = []
+        for cond in conditions:
+            query_condition = QueryCondition(
+                column=cond["column"],
+                operator=cond["operator"],
+                value=cond.get("value"),
+                logical_operator=cond.get("logical_operator", "AND"),
+            )
+            query_conditions.append(query_condition)
+        
+        result = await crud_ops.delete_records(
+            table_name=table_name,
+            conditions=query_conditions,
+            schema=schema,
+            returning_columns=returning_columns,
+        )
+        
+        if result.success:
+            response = {
+                "success": True,
+                "message": result.message,
+                "affected_rows": result.affected_rows,
+                "execution_time_ms": result.execution_time_ms,
+            }
+            if result.returned_data:
+                response["returned_data"] = result.returned_data
+            return format_text_response(response)
+        else:
+            return format_error_response(result.message)
+            
+    except Exception as e:
+        logger.error(f"Error deleting records from {table_name}: {e}")
+        return format_error_response(str(e))
+
+
+@mcp.tool(description="Query records from a table with advanced filtering, sorting, and pagination")
+async def query_records(
+    table_name: str = Field(description="Name of the table to query"),
+    columns: Optional[List[str]] = Field(description="List of columns to select (default: all columns)", default=None),
+    conditions: Optional[List[Dict[str, Any]]] = Field(description="""Optional list of conditions for WHERE clause. Each condition is a dictionary with:
+    - 'column': Column name
+    - 'operator': Operator (=, !=, >, <, >=, <=, LIKE, IN, NOT IN, IS NULL, IS NOT NULL)
+    - 'value': Value to compare (not needed for IS NULL/IS NOT NULL, list/tuple for IN/NOT IN)
+    - 'logical_operator': 'AND' or 'OR' (default: 'AND')
+
+Examples:
+[
+    {"column": "status", "operator": "=", "value": "active"},
+    {"column": "age", "operator": ">=", "value": 18, "logical_operator": "AND"}
+]""", default=None),
+    order_by: Optional[List[Dict[str, str]]] = Field(description="""Optional list of ordering specifications. Each is a dictionary with:
+    - 'column': Column name
+    - 'direction': 'ASC' or 'DESC'
+
+Examples: [{"column": "created_at", "direction": "DESC"}, {"column": "name", "direction": "ASC"}]""", default=None),
+    limit: Optional[int] = Field(description="Maximum number of records to return", default=None),
+    offset: Optional[int] = Field(description="Number of records to skip", default=None),
+    schema: str = Field(description="Schema name", default="public"),
+) -> ResponseType:
+    """Query records from a table with advanced filtering, sorting, and pagination."""
+    try:
+        sql_driver = await get_sql_driver()
+        crud_ops = CrudOperations(sql_driver)
+        
+        # 转换查询条件
+        query_conditions = None
+        if conditions:
+            query_conditions = []
+            for cond in conditions:
+                query_condition = QueryCondition(
+                    column=cond["column"],
+                    operator=cond["operator"],
+                    value=cond.get("value"),
+                    logical_operator=cond.get("logical_operator", "AND"),
+                )
+                query_conditions.append(query_condition)
+        
+        # 构建查询选项
+        options = QueryOptions(
+            limit=limit,
+            offset=offset,
+            order_by=order_by or [],
+        )
+        
+        result = await crud_ops.query_records(
+            table_name=table_name,
+            columns=columns,
+            conditions=query_conditions,
+            options=options,
+            schema=schema,
+        )
+        
+        if result.success:
+            return format_text_response({
+                "success": True,
+                "message": result.message,
+                "data": result.data,
+                "columns": result.columns,
+                "total_count": result.total_count,
+                "execution_time_ms": result.execution_time_ms,
+            })
+        else:
+            return format_error_response(result.message)
+            
+    except Exception as e:
+        logger.error(f"Error querying records from {table_name}: {e}")
+        return format_error_response(str(e))
+
+
+# ============================================================================
+# 数据库模式管理MCP工具
+# ============================================================================
+
+@mcp.tool(description="Create a new database schema")
+async def create_schema(
+    schema_name: str = Field(description="Name of the schema to create"),
+    if_not_exists: bool = Field(description="Use IF NOT EXISTS clause", default=True),
+) -> ResponseType:
+    """Create a new database schema."""
+    try:
+        sql_driver = await get_sql_driver()
+        schema_ops = SchemaOperations(sql_driver)
+        
+        result = await schema_ops.create_schema(schema_name, if_not_exists)
+        
+        if result.success:
+            return format_text_response({
+                "success": True,
+                "message": result.message,
+                "schema": schema_name,
+                "execution_time_ms": result.execution_time_ms,
+            })
+        else:
+            return format_error_response(result.message)
+            
+    except Exception as e:
+        logger.error(f"Error creating schema {schema_name}: {e}")
+        return format_error_response(str(e))
+
+
+@mcp.tool(description="Drop a database schema")
+async def drop_schema(
+    schema_name: str = Field(description="Name of the schema to drop"),
+    cascade: bool = Field(description="Use CASCADE to drop all dependent objects", default=False),
+    if_exists: bool = Field(description="Use IF EXISTS clause", default=True),
+) -> ResponseType:
+    """Drop a database schema."""
+    try:
+        sql_driver = await get_sql_driver()
+        schema_ops = SchemaOperations(sql_driver)
+        
+        result = await schema_ops.drop_schema(schema_name, cascade, if_exists)
+        
+        if result.success:
+            return format_text_response({
+                "success": True,
+                "message": result.message,
+                "schema": schema_name,
+                "execution_time_ms": result.execution_time_ms,
+            })
+        else:
+            return format_error_response(result.message)
+            
+    except Exception as e:
+        logger.error(f"Error dropping schema {schema_name}: {e}")
+        return format_error_response(str(e))
+
+
+@mcp.tool(description="Drop a table from the database")
+async def drop_table(
+    table_name: str = Field(description="Name of the table to drop"),
+    schema: str = Field(description="Schema name", default="public"),
+    cascade: bool = Field(description="Use CASCADE to drop all dependent objects", default=False),
+    if_exists: bool = Field(description="Use IF EXISTS clause", default=True),
+) -> ResponseType:
+    """Drop a table from the database."""
+    try:
+        sql_driver = await get_sql_driver()
+        schema_ops = SchemaOperations(sql_driver)
+        
+        result = await schema_ops.drop_table(table_name, schema, cascade, if_exists)
+        
+        if result.success:
+            return format_text_response({
+                "success": True,
+                "message": result.message,
+                "table": f"{schema}.{table_name}",
+                "execution_time_ms": result.execution_time_ms,
+            })
+        else:
+            return format_error_response(result.message)
+            
+    except Exception as e:
+        logger.error(f"Error dropping table {table_name}: {e}")
+        return format_error_response(str(e))
+
+
+@mcp.tool(description="Create an index on a table")
+async def create_index(
+    index_name: str = Field(description="Name of the index to create"),
+    table_name: str = Field(description="Name of the table to create index on"),
+    columns: List[str] = Field(description="List of column names to include in the index"),
+    index_type: str = Field(description="Index type: btree, hash, gin, gist, brin, spgist, hnsw (vector), ivfflat (vector)", default="btree"),
+    unique: bool = Field(description="Create a unique index", default=False),
+    partial_condition: Optional[str] = Field(description="WHERE clause for partial index", default=None),
+    vector_index_options: Optional[Dict[str, Any]] = Field(description="""Options for vector indexes (hnsw/ivfflat). Dictionary with options like:
+    - For HNSW: {"m": 16, "ef_construction": 64}
+    - For IVFFlat: {"lists": 100}""", default=None),
+) -> ResponseType:
+    """Create an index on a table."""
+    try:
+        sql_driver = await get_sql_driver()
+        schema_ops = SchemaOperations(sql_driver)
+        
+        index_def = IndexDefinition(
+            name=index_name,
+            table_name=table_name,
+            columns=columns,
+            index_type=index_type,
+            unique=unique,
+            partial_condition=partial_condition,
+            vector_index_options=vector_index_options or {},
+        )
+        
+        result = await schema_ops.create_index(index_def)
+        
+        if result.success:
+            return format_text_response({
+                "success": True,
+                "message": result.message,
+                "index": index_name,
+                "table": table_name,
+                "execution_time_ms": result.execution_time_ms,
+            })
+        else:
+            return format_error_response(result.message)
+            
+    except Exception as e:
+        logger.error(f"Error creating index {index_name}: {e}")
+        return format_error_response(str(e))
+
+
+@mcp.tool(description="Drop an index from the database")
+async def drop_index(
+    index_name: str = Field(description="Name of the index to drop"),
+    if_exists: bool = Field(description="Use IF EXISTS clause", default=True),
+    cascade: bool = Field(description="Use CASCADE to drop all dependent objects", default=False),
+) -> ResponseType:
+    """Drop an index from the database."""
+    try:
+        sql_driver = await get_sql_driver()
+        schema_ops = SchemaOperations(sql_driver)
+        
+        result = await schema_ops.drop_index(index_name, if_exists, cascade)
+        
+        if result.success:
+            return format_text_response({
+                "success": True,
+                "message": result.message,
+                "index": index_name,
+                "execution_time_ms": result.execution_time_ms,
+            })
+        else:
+            return format_error_response(result.message)
+            
+    except Exception as e:
+        logger.error(f"Error dropping index {index_name}: {e}")
+        return format_error_response(str(e))
+
+
+@mcp.tool(description="Create a PostgreSQL extension")
+async def create_extension(
+    extension_name: str = Field(description="Name of the extension to create (e.g., 'vector', 'pg_stat_statements')"),
+    if_not_exists: bool = Field(description="Use IF NOT EXISTS clause", default=True),
+    schema: Optional[str] = Field(description="Schema to install the extension in", default=None),
+) -> ResponseType:
+    """Create a PostgreSQL extension."""
+    try:
+        sql_driver = await get_sql_driver()
+        schema_ops = SchemaOperations(sql_driver)
+        
+        result = await schema_ops.create_extension(extension_name, if_not_exists, schema)
+        
+        if result.success:
+            return format_text_response({
+                "success": True,
+                "message": result.message,
+                "extension": extension_name,
+                "execution_time_ms": result.execution_time_ms,
+            })
+        else:
+            return format_error_response(result.message)
+            
+    except Exception as e:
+        logger.error(f"Error creating extension {extension_name}: {e}")
+        return format_error_response(str(e))
+
+
+# Vector-specific tools (Phase 2)
+
+@mcp.tool(description="Create a specialized table for vector storage with pgvector extension")
+async def create_vector_table(
+    table_name: str = Field(description="Name of the vector table to create"),
+    schema: str = Field(description="Schema name", default="public"),
+    vector_column: str = Field(description="Name of the vector column", default="embedding"),
+    vector_dimensions: int = Field(description="Number of dimensions for the vector", default=1536),
+    additional_columns: Optional[List[Dict[str, Any]]] = Field(description="""Additional columns to include. Each column is a dictionary with:
+    - 'name': Column name (required)
+    - 'data_type': Data type (required)
+    - 'nullable': Whether column can be NULL (default: true)
+    - 'default': Default value (optional)
+    - 'unique': Whether this column is unique (default: false)
+
+Examples:
+[
+    {"name": "content", "data_type": "text", "nullable": false},
+    {"name": "metadata", "data_type": "jsonb"},
+    {"name": "source", "data_type": "varchar"}
+]""", default=None),
+) -> ResponseType:
+    """Create a specialized table for vector storage."""
+    try:
+        sql_driver = await get_sql_driver()
+        vector_ops = VectorOperations(sql_driver)
+        
+        # 转换额外列定义
+        extra_columns = None
+        if additional_columns:
+            extra_columns = []
+            for col_dict in additional_columns:
+                col = ColumnDefinition(
+                    name=col_dict["name"],
+                    data_type=DataType(col_dict["data_type"]),
+                    nullable=col_dict.get("nullable", True),
+                    default=col_dict.get("default"),
+                    unique=col_dict.get("unique", False)
+                )
+                extra_columns.append(col)
+        
+        result = await vector_ops.create_vector_table(
+            table_name=table_name,
+            schema=schema,
+            vector_column=vector_column,
+            vector_dimensions=vector_dimensions,
+            additional_columns=extra_columns
+        )
+        
+        if result.success:
+            return format_text_response(result.message)
+        else:
+            return format_error_response(result.message)
+            
+    except Exception as e:
+        logger.error(f"Error creating vector table: {e}")
+        return format_error_response(str(e))
+
+
+@mcp.tool(description="Insert vector data into a vector table")
+async def insert_vector_data(
+    table_name: str = Field(description="Name of the vector table"),
+    vectors: List[List[float]] = Field(description="""List of vectors to insert. Each vector is a list of floats.
+Example: [[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]]"""),
+    schema: str = Field(description="Schema name", default="public"),
+    vector_column: str = Field(description="Name of the vector column", default="embedding"),
+    additional_data: Optional[List[Dict[str, Any]]] = Field(description="""Additional data for each vector. Must have same length as vectors list.
+Each item is a dictionary with column names as keys.
+Example: [{"content": "First text", "metadata": {"type": "doc"}}, {"content": "Second text"}]""", default=None),
+    returning_columns: Optional[List[str]] = Field(description="List of columns to return from inserted records", default=None),
+) -> ResponseType:
+    """Insert vector data into a vector table."""
+    try:
+        sql_driver = await get_sql_driver()
+        vector_ops = VectorOperations(sql_driver)
+        
+        result = await vector_ops.insert_vector_data(
+            table_name=table_name,
+            schema=schema,
+            vector_column=vector_column,
+            vectors=vectors,
+            additional_data=additional_data,
+            returning_columns=returning_columns
+        )
+        
+        if result.success:
+            response_data = {"message": result.message, "affected_rows": result.affected_rows}
+            if result.returned_data:
+                response_data["returned_data"] = result.returned_data
+            return format_text_response(response_data)
+        else:
+            return format_error_response(result.message)
+            
+    except Exception as e:
+        logger.error(f"Error inserting vector data: {e}")
+        return format_error_response(str(e))
+
+
+@mcp.tool(description="Perform vector similarity search to find similar vectors")
+async def vector_similarity_search(
+    table_name: str = Field(description="Name of the vector table to search"),
+    search_vector: List[float] = Field(description="Query vector to search for similar vectors"),
+    schema: str = Field(description="Schema name", default="public"),
+    vector_column: str = Field(description="Name of the vector column", default="embedding"),
+    distance_function: str = Field(description="Distance function: 'cosine', 'euclidean', or 'inner_product'", default="cosine"),
+    limit: int = Field(description="Maximum number of results to return", default=10),
+    threshold: Optional[float] = Field(description="Distance threshold to filter results", default=None),
+    additional_columns: Optional[List[str]] = Field(description="Additional columns to include in results", default=None),
+    include_distance: bool = Field(description="Include distance in results", default=True),
+) -> ResponseType:
+    """Perform vector similarity search."""
+    try:
+        sql_driver = await get_sql_driver()
+        vector_ops = VectorOperations(sql_driver)
+        
+        search_options = VectorSearchOptions(
+            vector=search_vector,
+            distance_function=distance_function,
+            limit=limit,
+            threshold=threshold,
+            include_distance=include_distance
+        )
+        
+        result = await vector_ops.vector_similarity_search(
+            table_name=table_name,
+            schema=schema,
+            vector_column=vector_column,
+            search_options=search_options,
+            additional_columns=additional_columns
+        )
+        
+        if result.success:
+            response_data = {
+                "message": result.message,
+                "total_results": result.total_count,
+                "results": result.data
+            }
+            return format_text_response(response_data)
+        else:
+            return format_error_response(result.message)
+            
+    except Exception as e:
+        logger.error(f"Error performing vector similarity search: {e}")
+        return format_error_response(str(e))
+
+
+@mcp.tool(description="Create a vector index for efficient similarity search")
+async def create_vector_index(
+    table_name: str = Field(description="Name of the table to create index on"),
+    schema: str = Field(description="Schema name", default="public"),
+    vector_column: str = Field(description="Name of the vector column", default="embedding"),
+    index_name: Optional[str] = Field(description="Custom index name (auto-generated if not provided)", default=None),
+    index_type: str = Field(description="Vector index type: 'hnsw' (recommended) or 'ivfflat'", default="hnsw"),
+    index_options: Optional[Dict[str, Any]] = Field(description="""Index-specific options:
+    - For HNSW: {"m": 16, "ef_construction": 64} (m: max connections per node, ef_construction: search scope during construction)
+    - For IVFFlat: {"lists": 100} (lists: number of inverted lists)""", default=None),
+) -> ResponseType:
+    """Create a vector index for efficient similarity search."""
+    try:
+        sql_driver = await get_sql_driver()
+        vector_ops = VectorOperations(sql_driver)
+        
+        result = await vector_ops.create_vector_index(
+            table_name=table_name,
+            schema=schema,
+            vector_column=vector_column,
+            index_name=index_name,
+            index_type=index_type,
+            index_options=index_options
+        )
+        
+        if result.success:
+            return format_text_response(result.message)
+        else:
+            return format_error_response(result.message)
+            
+    except Exception as e:
+        logger.error(f"Error creating vector index: {e}")
         return format_error_response(str(e))
 
 
