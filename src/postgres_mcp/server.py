@@ -1213,6 +1213,115 @@ async def create_vector_index(
         return format_error_response(str(e))
 
 
+@mcp.tool(description="Perform K-nearest neighbor (KNN) vector search to find the k most similar vectors")
+async def vector_knn_search(
+    table_name: str = Field(description="Name of the vector table to search"),
+    search_vector: List[float] = Field(description="Query vector to search for similar vectors"),
+    k: int = Field(description="Number of nearest neighbors to return", default=10),
+    schema: str = Field(description="Schema name", default="public"),
+    vector_column: str = Field(description="Name of the vector column", default="embedding"),
+    distance_function: str = Field(description="Distance function: 'cosine', 'euclidean', or 'inner_product'", default="cosine"),
+    additional_columns: Optional[List[str]] = Field(description="Additional columns to include in results", default=None),
+    include_distance: bool = Field(description="Include distance in results", default=True),
+) -> ResponseType:
+    """Perform K-nearest neighbor (KNN) vector search."""
+    try:
+        sql_driver = await get_sql_driver()
+        vector_ops = VectorOperations(sql_driver)
+        
+        result = await vector_ops.vector_knn_search(
+            table_name=table_name,
+            schema=schema,
+            vector_column=vector_column,
+            search_vector=search_vector,
+            k=k,
+            distance_function=distance_function,
+            additional_columns=additional_columns,
+            include_distance=include_distance
+        )
+        
+        if result.success:
+            response = {
+                "message": result.message,
+                "data": result.data,
+                "columns": result.columns,
+                "total_count": result.total_count,
+                "execution_time_ms": result.execution_time_ms
+            }
+            return format_text_response(response)
+        else:
+            return format_error_response(result.message)
+        
+    except Exception as e:
+        logger.error(f"Error in vector KNN search: {e}")
+        return format_error_response(str(e))
+
+
+@mcp.tool(description="Get statistics and monitoring information for vector indexes")
+async def get_vector_index_stats(
+    table_name: str = Field(description="Name of the table containing vector indexes"),
+    schema: str = Field(description="Schema name", default="public"),
+    vector_column: str = Field(description="Name of the vector column", default="embedding"),
+) -> ResponseType:
+    """Get statistics and monitoring information for vector indexes."""
+    try:
+        sql_driver = await get_sql_driver()
+        vector_ops = VectorOperations(sql_driver)
+        
+        result = await vector_ops.get_vector_index_stats(
+            table_name=table_name,
+            schema=schema,
+            vector_column=vector_column
+        )
+        
+        if result.success:
+            response = {
+                "message": result.message,
+                "data": result.data,
+                "columns": result.columns,
+                "total_count": result.total_count,
+                "execution_time_ms": result.execution_time_ms
+            }
+            return format_text_response(response)
+        else:
+            return format_error_response(result.message)
+        
+    except Exception as e:
+        logger.error(f"Error getting vector index stats: {e}")
+        return format_error_response(str(e))
+
+
+@mcp.tool(description="Optimize a vector index by rebuilding it for better performance")
+async def optimize_vector_index(
+    index_name: str = Field(description="Name of the vector index to optimize"),
+    schema: str = Field(description="Schema name", default="public"),
+) -> ResponseType:
+    """Optimize a vector index by rebuilding it."""
+    try:
+        sql_driver = await get_sql_driver()
+        vector_ops = VectorOperations(sql_driver)
+        
+        result = await vector_ops.optimize_vector_index(
+            index_name=index_name,
+            schema=schema
+        )
+        
+        if result.success:
+            response = {
+                "message": result.message,
+                "operation_type": result.operation_type.value,
+                "table_name": result.table_name,
+                "execution_time_ms": result.execution_time_ms
+            }
+            return format_text_response(response)
+        else:
+            return format_error_response(result.message)
+        
+    except Exception as e:
+        logger.error(f"Error optimizing vector index: {e}")
+        return format_error_response(str(e))
+
+
 async def main():
     # Parse command line arguments
     parser = argparse.ArgumentParser(description="PostgreSQL MCP Server")

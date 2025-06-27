@@ -230,6 +230,75 @@ class VectorOperations:
             return f'"{vector_column}" <#> \'{vector_str}\'::vector'
         else:
             raise ValueError(f"Unsupported distance function: {distance_function}")
+    
+    async def vector_knn_search(self, table_name: str, schema: str = "public",
+                               vector_column: str = "embedding",
+                               search_vector: List[float],
+                               k: int = 10,
+                               distance_function: str = "cosine",
+                               additional_columns: Optional[List[str]] = None,
+                               include_distance: bool = True) -> QueryResult:
+        """K最近邻向量搜索（专用于精确的K-NN搜索）"""
+        start_time = time.time()
+        
+        try:
+            # 构建SELECT子句
+            select_columns = ["id"]
+            if additional_columns:
+                select_columns.extend(additional_columns)
+            
+            if include_distance:
+                distance_expr = self._get_distance_expression(
+                    vector_column, 
+                    search_vector, 
+                    distance_function
+                )
+                select_columns.append(f"{distance_expr} AS distance")
+            
+            select_sql = ", ".join([f'"{col}"' if not col.endswith(' AS distance') else col for col in select_columns])
+            
+            # 构建查询SQL - 专注于KNN搜索
+            distance_expr = self._get_distance_expression(
+                vector_column, 
+                search_vector, 
+                distance_function
+            )
+            
+            sql = f'''SELECT {select_sql} 
+                     FROM "{schema}"."{table_name}" 
+                     ORDER BY {distance_expr} 
+                     LIMIT {k}'''
+            
+            logger.info(f"Vector KNN search (k={k}) in {schema}.{table_name}")
+            logger.debug(f"SQL: {sql}")
+            logger.debug(f"Search vector dimensions: {len(search_vector)}")
+            
+            result = await self.sql_driver.execute_query(sql)
+            
+            execution_time = (time.time() - start_time) * 1000
+            
+            data = [row.cells for row in result] if result else []
+            column_names = list(data[0].keys()) if data else []
+            
+            return QueryResult(
+                success=True,
+                message=f"Vector KNN search completed, found {len(data)} nearest neighbors",
+                data=data,
+                columns=column_names,
+                total_count=len(data),
+                execution_time_ms=execution_time
+            )
+            
+        except Exception as e:
+            execution_time = (time.time() - start_time) * 1000
+            logger.error(f"Error in vector KNN search: {e}")
+            
+            return QueryResult(
+                success=False,
+                message=f"Vector KNN search failed: {str(e)}",
+                data=[],
+                execution_time_ms=execution_time
+            )
 
     async def create_vector_index(self, table_name: str, schema: str = "public",
                                 vector_column: str = "embedding",
@@ -388,4 +457,101 @@ class VectorOperations:
                 operation_type=OperationType.INSERT,
                 table_name=f"{schema}.{table_name}",
                 execution_time_ms=execution_time
-            ) 
+            )
+    
+    async def get_vector_index_stats(self, table_name: str, schema: str = "public",
+                                   vector_column: str = "embedding") -> QueryResult:
+        """获取向量索引统计信息"""
+        start_time = time.time()
+        
+        try:
+            # 查询向量索引信息
+            sql = """
+            SELECT 
+                schemaname,
+                tablename,
+                indexname,
+                indexdef,
+                pg_size_pretty(pg_relation_size(indexname::regclass)) AS index_size,
+                (SELECT amname FROM pg_am WHERE oid = (
+                    SELECT relam FROM pg_class WHERE relname = indexname
+                )) AS index_method,
+                (SELECT n_tup_ins FROM pg_stat_user_tables WHERE 
+                 schemaname = %s AND tablename = %s) AS table_inserts,
+                (SELECT n_tup_upd FROM pg_stat_user_tables WHERE 
+                 schemaname = %s AND tablename = %s) AS table_updates,
+                (SELECT n_tup_del FROM pg_stat_user_tables WHERE 
+                 schemaname = %s AND tablename = %s) AS table_deletes
+            FROM pg_indexes 
+            WHERE schemaname = %s 
+            AND tablename = %s 
+            AND indexdef LIKE %s
+            """
+            
+            column_pattern = f'%{vector_column}%'
+            params = [schema, table_name, schema, table_name, schema, table_name, 
+                     schema, table_name, column_pattern]
+            
+            result = await self.sql_driver.execute_query(sql, params)
+            
+            execution_time = (time.time() - start_time) * 1000
+            
+            data = [row.cells for row in result] if result else []
+            column_names = list(data[0].keys()) if data else []
+            
+            logger.info(f"Retrieved vector index stats for {schema}.{table_name}.{vector_column}")
+            
+            return QueryResult(
+                success=True,
+                message=f"Vector index statistics retrieved for {schema}.{table_name}",
+                data=data,
+                columns=column_names,
+                total_count=len(data),
+                execution_time_ms=execution_time
+            )
+            
+        except Exception as e:
+            execution_time = (time.time() - start_time) * 1000
+            logger.error(f"Error getting vector index stats: {e}")
+            
+            return QueryResult(
+                success=False,
+                message=f"Failed to get vector index stats: {str(e)}",
+                data=[],
+                execution_time_ms=execution_time
+            )
+    
+    async def optimize_vector_index(self, index_name: str, schema: str = "public") -> OperationResult:
+        """优化向量索引（重建索引以提高性能）"""
+        start_time = time.time()
+        
+        try:
+            # 重建索引以优化性能
+            sql = f'REINDEX INDEX "{schema}"."{index_name}"'
+            
+            logger.info(f"Optimizing vector index: {schema}.{index_name}")
+            logger.debug(f"SQL: {sql}")
+            
+            await self.sql_driver.execute_query(sql)
+            
+            execution_time = (time.time() - start_time) * 1000
+            
+            return OperationResult(
+                success=True,
+                message=f"Vector index {schema}.{index_name} optimized successfully",
+                operation_type=OperationType.UPDATE,
+                table_name=f"{schema}.{index_name}",
+                execution_time_ms=execution_time
+            )
+            
+        except Exception as e:
+            execution_time = (time.time() - start_time) * 1000
+            logger.error(f"Error optimizing vector index: {e}")
+            
+            return OperationResult(
+                success=False,
+                message=f"Failed to optimize vector index: {str(e)}",
+                operation_type=OperationType.UPDATE,
+                table_name=f"{schema}.{index_name}",
+                execution_time_ms=execution_time
+            )

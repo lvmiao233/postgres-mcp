@@ -657,6 +657,19 @@ class SafeSqlDriver(SqlDriver):
         "first_value",
         "last_value",
         "nth_value",
+        # pgvector functions
+        "binary_quantize",
+        "cosine_distance",
+        "inner_product",
+        "l1_distance",
+        "l2_distance",
+        "l2_normalize",
+        "l2_norm",
+        "subvector",
+        "vector_dims",
+        "vector_norm",
+        "hamming_distance",
+        "jaccard_distance",
     }
 
     ALLOWED_NODE_TYPES: ClassVar[set[type]] = ALLOWED_STMT_TYPES | {
